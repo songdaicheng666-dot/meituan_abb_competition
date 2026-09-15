@@ -1,0 +1,239 @@
+MODULE PythonBridge
+
+    ! Python TCP bridge for ABB RobotWare 7.
+    ! Fixed-target validation only; no arbitrary motion commands.
+
+    CONST string PYB_SERVER_IP := "192.168.125.1";
+    CONST num PYB_SERVER_PORT := 55000;
+    CONST num PYB_FRAME_SIZE := 64;
+    CONST num PYB_REQUIRED_TOOL_STATE := 2;
+
+    ! Safety gate: these targets are placeholders and cannot be moved to until
+    ! CapturePyHome and CapturePyTest have both been executed on the real robot.
+    PERS jointtarget pyHome := [[0,0,0,0,0,0],[9E9,9E9,9E9,9E9,9E9,9E9]];
+    PERS jointtarget pyTest := [[0,0,0,0,0,0],[9E9,9E9,9E9,9E9,9E9,9E9]];
+    PERS bool pyHomeCaptured := FALSE;
+    PERS bool pyTestCaptured := FALSE;
+
+    ! The controller backup shows that toolState=2 means the P tool is fitted.
+    ! tool_P is a global PERS tooldata in the existing user system module.
+    ! Reusing it here keeps one authoritative TCP/load definition.
+
+    VAR socketdev pybListenSocket;
+    VAR socketdev pybClientSocket;
+    VAR bool pybClientConnected := FALSE;
+    VAR string pybRxFrame := "";
+    VAR string pybState := "IDLE";
+    VAR jointtarget pybCurrentJoints;
+
+    PROC CapturePyHome()
+        pyHome := CJointT();
+        pyHomeCaptured := TRUE;
+        TPWrite "pyHome captured";
+    ENDPROC
+
+    PROC CapturePyTest()
+        pyTest := CJointT();
+        pyTestCaptured := TRUE;
+        TPWrite "pyTest captured";
+    ENDPROC
+
+    FUNC bool PybMotionConfigured()
+        RETURN (toolState = PYB_REQUIRED_TOOL_STATE) AND
+               pyHomeCaptured AND pyTestCaptured;
+    ENDFUNC
+
+    FUNC bool PybIsCommand(string command, num commandLength)
+        VAR num characterIndex;
+
+        IF StrPart(pybRxFrame,1,commandLength) <> command THEN
+            RETURN FALSE;
+        ENDIF
+
+        ! Every remaining character must be padding. This rejects values such
+        ! as "PING X" rather than treating them as the PING command.
+        FOR characterIndex FROM commandLength + 1 TO PYB_FRAME_SIZE DO
+            IF NOT StrMemb(pybRxFrame,characterIndex," ") THEN
+                RETURN FALSE;
+            ENDIF
+        ENDFOR
+
+        RETURN TRUE;
+    ENDFUNC
+
+    FUNC string PybVisibleState()
+        IF toolState <> PYB_REQUIRED_TOOL_STATE THEN
+            RETURN "WRONG_TOOL";
+        ELSEIF NOT pyHomeCaptured THEN
+            RETURN "NO_HOME";
+        ELSEIF NOT pyTestCaptured THEN
+            RETURN "NO_TEST";
+        ENDIF
+
+        RETURN pybState;
+    ENDFUNC
+
+    PROC PybSend(string response)
+        IF pybClientConnected THEN
+            SocketSend pybClientSocket \Str:=response;
+        ENDIF
+    ERROR
+        IF ERRNO = ERR_SOCK_CLOSED OR ERRNO = ERR_SOCK_TIMEOUT THEN
+            pybClientConnected := FALSE;
+            TRYNEXT;
+        ELSE
+            RAISE;
+        ENDIF
+    ENDPROC
+
+    PROC PybReceive()
+        pybRxFrame := "";
+        SocketReceive pybClientSocket \Str:=pybRxFrame
+            \ReadNoOfBytes:=PYB_FRAME_SIZE \Time:=60;
+    ERROR
+        IF ERRNO = ERR_SOCK_TIMEOUT THEN
+            RETRY;
+        ELSEIF ERRNO = ERR_SOCK_CLOSED THEN
+            pybClientConnected := FALSE;
+            TRYNEXT;
+        ELSE
+            RAISE;
+        ENDIF
+    ENDPROC
+
+    PROC PybCloseClient()
+        SocketClose pybClientSocket;
+        pybClientConnected := FALSE;
+    ERROR
+        pybClientConnected := FALSE;
+        TRYNEXT;
+    ENDPROC
+
+    PROC PybCloseListener()
+        SocketClose pybListenSocket;
+    ERROR
+        TRYNEXT;
+    ENDPROC
+
+    PROC PybSendJoints()
+        VAR string response;
+
+        pybCurrentJoints := CJointT();
+        response := "OK JOINTS ";
+        response := response + NumToStr(pybCurrentJoints.robax.rax_1,2) + ",";
+        response := response + NumToStr(pybCurrentJoints.robax.rax_2,2) + ",";
+        response := response + NumToStr(pybCurrentJoints.robax.rax_3,2) + ",";
+        response := response + NumToStr(pybCurrentJoints.robax.rax_4,2) + ",";
+        response := response + NumToStr(pybCurrentJoints.robax.rax_5,2) + ",";
+        response := response + NumToStr(pybCurrentJoints.robax.rax_6,2) + "#";
+        PybSend response;
+    ENDPROC
+
+    PROC PybMoveHome()
+        IF toolState <> PYB_REQUIRED_TOOL_STATE THEN
+            PybSend "ERR WRONG_TOOL#";
+            RETURN;
+        ENDIF
+
+        IF NOT PybMotionConfigured() THEN
+            PybSend "ERR NOT_CONFIGURED#";
+            RETURN;
+        ENDIF
+
+        PybSend "OK ACCEPTED HOME#";
+        IF NOT pybClientConnected THEN
+            RETURN;
+        ENDIF
+
+        pybState := "MOVING";
+        MoveAbsJ pyHome,v20,fine,tool_P;
+        pybState := "IDLE";
+        PybSend "OK DONE HOME#";
+    ENDPROC
+
+    PROC PybMoveTest()
+        IF toolState <> PYB_REQUIRED_TOOL_STATE THEN
+            PybSend "ERR WRONG_TOOL#";
+            RETURN;
+        ENDIF
+
+        IF NOT PybMotionConfigured() THEN
+            PybSend "ERR NOT_CONFIGURED#";
+            RETURN;
+        ENDIF
+
+        PybSend "OK ACCEPTED TEST#";
+        IF NOT pybClientConnected THEN
+            RETURN;
+        ENDIF
+
+        pybState := "MOVING";
+        MoveAbsJ pyTest,v20,fine,tool_P;
+        pybState := "IDLE";
+        PybSend "OK DONE TEST#";
+    ENDPROC
+
+    PROC PybProcessRequest()
+        IF PybIsCommand("PING",4) THEN
+            PybSend "OK PONG#";
+        ELSEIF PybIsCommand("GET_STATE",9) THEN
+            PybSend "OK STATE " + PybVisibleState() + "#";
+        ELSEIF PybIsCommand("GET_JOINTS",10) THEN
+            PybSendJoints;
+        ELSEIF PybIsCommand("MOVE HOME",9) THEN
+            PybMoveHome;
+        ELSEIF PybIsCommand("MOVE TEST",9) THEN
+            PybMoveTest;
+        ELSEIF PybIsCommand("QUIT",4) THEN
+            PybSend "OK BYE#";
+            pybClientConnected := FALSE;
+        ELSE
+            PybSend "ERR UNKNOWN_COMMAND#";
+        ENDIF
+    ENDPROC
+
+    PROC PythonBridgeMain()
+        VAR string errorNumber;
+
+        ! Make repeated manual starts deterministic after a prior stopped run.
+        PybCloseClient;
+        PybCloseListener;
+        WaitTime 0.2;
+
+        pybState := "IDLE";
+        SocketCreate pybListenSocket;
+        SocketBind pybListenSocket,PYB_SERVER_IP,PYB_SERVER_PORT;
+        SocketListen pybListenSocket;
+        TPWrite "PyBridge listening: 55000";
+
+        WHILE TRUE DO
+            TPWrite "PyBridge waiting for PC";
+            SocketAccept pybListenSocket,pybClientSocket;
+            pybClientConnected := TRUE;
+            TPWrite "PyBridge client connected";
+
+            WHILE pybClientConnected DO
+                PybReceive;
+                IF pybClientConnected THEN
+                    PybProcessRequest;
+                ENDIF
+            ENDWHILE
+
+            PybCloseClient;
+            TPWrite "PyBridge client disconnected";
+        ENDWHILE
+    ERROR
+        errorNumber := NumToStr(ERRNO,0);
+        IF pybState = "MOVING" THEN
+            PybSend "ERR MOTION " + errorNumber + "#";
+        ELSE
+            PybSend "ERR BRIDGE " + errorNumber + "#";
+        ENDIF
+        pybState := "ERROR";
+        TPWrite "PyBridge stopped, error=" + errorNumber;
+        PybCloseClient;
+        PybCloseListener;
+        Stop;
+    ENDPROC
+
+ENDMODULE
