@@ -2,3 +2,6 @@ __pycache__/
 *.py[cod]
 .venv/
 *_BACKUP_*/
+trajectory.json
+*.json.part
+*.json.tmp

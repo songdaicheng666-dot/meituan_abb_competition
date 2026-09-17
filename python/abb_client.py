@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Safe, fixed-target TCP client for the ABB RAPID PythonBridge module."""
+"""Supervised TCP client for fixed targets and validated ABB trajectories."""
 
 from __future__ import annotations
 
 import argparse
+import math
 import socket
 import sys
 import time
@@ -16,6 +17,7 @@ DEFAULT_PORT = 55000
 REQUEST_SIZE = 64
 RESPONSE_TERMINATOR = b"#"
 MAX_RESPONSE_SIZE = 80
+TRAJECTORY_PROGRESS_INTERVAL = 25
 
 
 class BridgeError(RuntimeError):
@@ -91,6 +93,18 @@ def parse_joints(response: str) -> List[float]:
         return [float(field) for field in fields]
     except ValueError as exc:
         raise ProtocolError(f"invalid joint value in response: {response!r}") from exc
+
+
+def encode_trajectory_point(joints: Sequence[float]) -> bytes:
+    """Encode one six-axis trajectory point as a fixed-size request frame."""
+    if len(joints) != 6:
+        raise ValueError("trajectory points must contain exactly 6 joint values")
+
+    values = [float(value) for value in joints]
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("trajectory joint values must be finite")
+
+    return encode_request("P " + " ".join(f"{value:.2f}" for value in values))
 
 
 @dataclass(frozen=True)
@@ -217,6 +231,57 @@ class AbbTcpClient:
         expected_completed = f"OK DONE {normalized_target}#"
         if completed != expected_completed:
             raise ProtocolError(f"unexpected motion completion: {completed!r}")
+
+    def play_trajectory(self, points: Sequence[Sequence[float]]) -> None:
+        """Stream one validated trajectory. An accepted replay is never retried."""
+        if len(points) < 2:
+            raise ValueError("trajectory must contain at least 2 points")
+
+        encoded_points = [encode_trajectory_point(point) for point in points]
+        self._send(f"PLAY BEGIN {len(encoded_points)}")
+        ready = self._receive(self.config.response_timeout)
+        self._raise_if_error(ready)
+        if ready != "OK READY FIRST#":
+            raise ProtocolError(f"unexpected trajectory readiness response: {ready!r}")
+
+        self._require_socket().sendall(encoded_points[0])
+        accepted = self._receive(self.config.response_timeout)
+        self._raise_if_error(accepted)
+        if accepted != "OK ACCEPTED TRAJECTORY#":
+            raise ProtocolError(f"unexpected trajectory acceptance: {accepted!r}")
+
+        try:
+            next_index = 1
+            while next_index < len(encoded_points):
+                batch_end = min(
+                    (next_index // TRAJECTORY_PROGRESS_INTERVAL + 1)
+                    * TRAJECTORY_PROGRESS_INTERVAL,
+                    len(encoded_points),
+                )
+                self._require_socket().sendall(
+                    b"".join(encoded_points[next_index:batch_end])
+                )
+                progress = self._receive(self.config.motion_timeout)
+                self._raise_if_error(progress)
+                expected_progress = f"OK RECEIVED {batch_end}#"
+                if progress != expected_progress:
+                    raise ProtocolError(
+                        f"unexpected trajectory progress: {progress!r}"
+                    )
+                next_index = batch_end
+
+            completed = self._receive(self.config.motion_timeout)
+            self._raise_if_error(completed)
+            if completed != "OK DONE TRAJECTORY#":
+                raise ProtocolError(
+                    f"unexpected trajectory completion response: {completed!r}"
+                )
+        except (ControllerError, ProtocolError, TimeoutError, ConnectionError, OSError) as exc:
+            raise BridgeError(
+                "trajectory result is unknown; inspect the robot and controller "
+                "before issuing any new motion command, and never retry automatically. "
+                f"Detail: {exc}"
+            ) from exc
 
     def quit(self) -> None:
         if self._socket is None:

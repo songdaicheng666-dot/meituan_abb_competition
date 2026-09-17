@@ -185,3 +185,27 @@ python -B -m unittest discover -s tests -v
 
 需要回退时，停止 RAPID，从 `T_ROB1` 卸载 `PythonBridge`，把程序指针重置到
 现有应用的 `main`；必要时恢复最初备份。
+
+## 8. 连续轨迹录制与重放
+
+连续轨迹功能的完整现场步骤见 `docs/trajectory_recording.md`。第一版只允许空载低速验证，不会操作
+吸盘、相机或其他 I/O。
+
+新增命令：
+
+```powershell
+# 全局参数必须放在子命令前面。
+$env:ABB_RWS_USER = "Default User"
+$env:ABB_RWS_PASSWORD = "<控制器UAS密码>"
+
+python python\trajectory.py --insecure rws-check
+python python\trajectory.py --insecure record --file trajectory.json
+python python\trajectory.py validate --file trajectory.json
+python python\trajectory.py play --file trajectory.json
+```
+
+`--insecure` 只能在隔离的实验室局域网中显式使用。能够导出/信任控制器证书时，应改用
+`--ca-cert <证书路径>`。账号和密码不会写入轨迹文件。
+
+更换控制器中的 `PythonBridge.modx` 后，必须检查 `pyHomeCaptured` 是否仍为 `TRUE`。如果变成
+`FALSE`，需按第4节重新执行 `CapturePyHome`；未重新捕获前，录制和重放都会被拒绝。

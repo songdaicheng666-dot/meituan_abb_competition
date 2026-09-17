@@ -1,12 +1,17 @@
 MODULE PythonBridge
 
     ! Python TCP bridge for ABB RobotWare 7.
-    ! Fixed-target validation only; no arbitrary motion commands.
+    ! Supports fixed targets and a validated, streamed joint trajectory.
 
     CONST string PYB_SERVER_IP := "192.168.125.1";
     CONST num PYB_SERVER_PORT := 55000;
     CONST num PYB_FRAME_SIZE := 64;
     CONST num PYB_REQUIRED_TOOL_STATE := 2;
+    CONST num PYB_HOME_TOLERANCE := 0.2;
+    CONST num PYB_MAX_JOINT_STEP := 1.0;
+    CONST num PYB_MAX_ABS_JOINT := 720;
+    CONST num PYB_PROGRESS_INTERVAL := 25;
+    CONST num PYB_STREAM_TIMEOUT := 10;
 
     ! Safety gate: these targets are placeholders and cannot be moved to until
     ! CapturePyHome and CapturePyTest have both been executed on the real robot.
@@ -25,6 +30,8 @@ MODULE PythonBridge
     VAR string pybRxFrame := "";
     VAR string pybState := "IDLE";
     VAR jointtarget pybCurrentJoints;
+    VAR bool pybStreamFrameReady := FALSE;
+    VAR bool pybStreamTimedOut := FALSE;
 
     PROC CapturePyHome()
         pyHome := CJointT();
@@ -53,7 +60,7 @@ MODULE PythonBridge
         ! Every remaining character must be padding. This rejects values such
         ! as "PING X" rather than treating them as the PING command.
         FOR characterIndex FROM commandLength + 1 TO PYB_FRAME_SIZE DO
-            IF NOT StrMemb(pybRxFrame,characterIndex," ") THEN
+            IF StrMemb(pybRxFrame,characterIndex," ") = FALSE THEN
                 RETURN FALSE;
             ENDIF
         ENDFOR
@@ -61,12 +68,148 @@ MODULE PythonBridge
         RETURN TRUE;
     ENDFUNC
 
+    FUNC bool PybReadNumber(VAR num cursor, VAR num value)
+        VAR num tokenStart;
+        VAR num tokenLength;
+        VAR string token;
+
+        WHILE cursor <= PYB_FRAME_SIZE AND
+              StrMemb(pybRxFrame,cursor," ") DO
+            cursor := cursor + 1;
+        ENDWHILE
+
+        IF cursor > PYB_FRAME_SIZE THEN
+            RETURN FALSE;
+        ENDIF
+
+        tokenStart := cursor;
+        WHILE cursor <= PYB_FRAME_SIZE AND
+              StrMemb(pybRxFrame,cursor," ") = FALSE DO
+            cursor := cursor + 1;
+        ENDWHILE
+
+        tokenLength := cursor - tokenStart;
+        IF tokenLength < 1 THEN
+            RETURN FALSE;
+        ENDIF
+
+        token := StrPart(pybRxFrame,tokenStart,tokenLength);
+        RETURN StrToVal(token,value);
+    ENDFUNC
+
+    FUNC bool PybOnlyPaddingRemains(num cursor)
+        WHILE cursor <= PYB_FRAME_SIZE DO
+            IF StrMemb(pybRxFrame,cursor," ") = FALSE THEN
+                RETURN FALSE;
+            ENDIF
+            cursor := cursor + 1;
+        ENDWHILE
+        RETURN TRUE;
+    ENDFUNC
+
+    FUNC bool PybParsePlayCount(VAR num pointCount)
+        VAR num cursor := 12;
+
+        IF StrPart(pybRxFrame,1,11) <> "PLAY BEGIN " THEN
+            RETURN FALSE;
+        ENDIF
+        IF PybReadNumber(cursor,pointCount) = FALSE THEN
+            RETURN FALSE;
+        ENDIF
+        IF PybOnlyPaddingRemains(cursor) = FALSE THEN
+            RETURN FALSE;
+        ENDIF
+        IF pointCount < 2 OR pointCount > 999999999 THEN
+            RETURN FALSE;
+        ENDIF
+        IF pointCount MOD 1 <> 0 THEN
+            RETURN FALSE;
+        ENDIF
+        RETURN TRUE;
+    ENDFUNC
+
+    FUNC bool PybJointValueValid(num value)
+        RETURN Abs(value) <= PYB_MAX_ABS_JOINT;
+    ENDFUNC
+
+    FUNC bool PybParsePoint(VAR jointtarget point)
+        VAR num cursor := 3;
+        VAR num j1;
+        VAR num j2;
+        VAR num j3;
+        VAR num j4;
+        VAR num j5;
+        VAR num j6;
+
+        IF StrPart(pybRxFrame,1,2) <> "P " THEN
+            RETURN FALSE;
+        ENDIF
+        IF PybReadNumber(cursor,j1) = FALSE THEN
+            RETURN FALSE;
+        ENDIF
+        IF PybReadNumber(cursor,j2) = FALSE THEN
+            RETURN FALSE;
+        ENDIF
+        IF PybReadNumber(cursor,j3) = FALSE THEN
+            RETURN FALSE;
+        ENDIF
+        IF PybReadNumber(cursor,j4) = FALSE THEN
+            RETURN FALSE;
+        ENDIF
+        IF PybReadNumber(cursor,j5) = FALSE THEN
+            RETURN FALSE;
+        ENDIF
+        IF PybReadNumber(cursor,j6) = FALSE THEN
+            RETURN FALSE;
+        ENDIF
+        IF PybOnlyPaddingRemains(cursor) = FALSE THEN
+            RETURN FALSE;
+        ENDIF
+        IF PybJointValueValid(j1) = FALSE OR PybJointValueValid(j2) = FALSE OR
+           PybJointValueValid(j3) = FALSE OR PybJointValueValid(j4) = FALSE OR
+           PybJointValueValid(j5) = FALSE OR PybJointValueValid(j6) = FALSE THEN
+            RETURN FALSE;
+        ENDIF
+
+        point := [[j1,j2,j3,j4,j5,j6],
+                  [9E9,9E9,9E9,9E9,9E9,9E9]];
+        RETURN TRUE;
+    ENDFUNC
+
+    FUNC num PybJointDistance(jointtarget first, jointtarget second)
+        VAR num maximum;
+        VAR num difference;
+
+        maximum := Abs(first.robax.rax_1 - second.robax.rax_1);
+        difference := Abs(first.robax.rax_2 - second.robax.rax_2);
+        IF difference > maximum THEN
+            maximum := difference;
+        ENDIF
+        difference := Abs(first.robax.rax_3 - second.robax.rax_3);
+        IF difference > maximum THEN
+            maximum := difference;
+        ENDIF
+        difference := Abs(first.robax.rax_4 - second.robax.rax_4);
+        IF difference > maximum THEN
+            maximum := difference;
+        ENDIF
+        difference := Abs(first.robax.rax_5 - second.robax.rax_5);
+        IF difference > maximum THEN
+            maximum := difference;
+        ENDIF
+        difference := Abs(first.robax.rax_6 - second.robax.rax_6);
+        IF difference > maximum THEN
+            maximum := difference;
+        ENDIF
+        RETURN maximum;
+    ENDFUNC
+
     FUNC string PybVisibleState()
         IF toolState <> PYB_REQUIRED_TOOL_STATE THEN
             RETURN "WRONG_TOOL";
-        ELSEIF NOT pyHomeCaptured THEN
+        ELSEIF pyHomeCaptured = FALSE THEN
             RETURN "NO_HOME";
-        ELSEIF NOT pyTestCaptured THEN
+        ELSEIF pyTestCaptured = FALSE THEN
             RETURN "NO_TEST";
         ENDIF
 
@@ -95,6 +238,29 @@ MODULE PythonBridge
             RETRY;
         ELSEIF ERRNO = ERR_SOCK_CLOSED THEN
             pybClientConnected := FALSE;
+            TRYNEXT;
+        ELSE
+            RAISE;
+        ENDIF
+    ENDPROC
+
+    PROC PybReceiveStream()
+        pybRxFrame := "";
+        pybStreamFrameReady := FALSE;
+        pybStreamTimedOut := FALSE;
+        SocketReceive pybClientSocket \Str:=pybRxFrame
+            \ReadNoOfBytes:=PYB_FRAME_SIZE \Time:=PYB_STREAM_TIMEOUT;
+        IF pybClientConnected AND pybStreamTimedOut = FALSE THEN
+            pybStreamFrameReady := TRUE;
+        ENDIF
+    ERROR
+        IF ERRNO = ERR_SOCK_TIMEOUT THEN
+            pybStreamTimedOut := TRUE;
+            pybStreamFrameReady := FALSE;
+            TRYNEXT;
+        ELSEIF ERRNO = ERR_SOCK_CLOSED THEN
+            pybClientConnected := FALSE;
+            pybStreamFrameReady := FALSE;
             TRYNEXT;
         ELSE
             RAISE;
@@ -135,13 +301,13 @@ MODULE PythonBridge
             RETURN;
         ENDIF
 
-        IF NOT PybMotionConfigured() THEN
+        IF PybMotionConfigured() = FALSE THEN
             PybSend "ERR NOT_CONFIGURED#";
             RETURN;
         ENDIF
 
         PybSend "OK ACCEPTED HOME#";
-        IF NOT pybClientConnected THEN
+        IF pybClientConnected = FALSE THEN
             RETURN;
         ENDIF
 
@@ -157,13 +323,13 @@ MODULE PythonBridge
             RETURN;
         ENDIF
 
-        IF NOT PybMotionConfigured() THEN
+        IF PybMotionConfigured() = FALSE THEN
             PybSend "ERR NOT_CONFIGURED#";
             RETURN;
         ENDIF
 
         PybSend "OK ACCEPTED TEST#";
-        IF NOT pybClientConnected THEN
+        IF pybClientConnected = FALSE THEN
             RETURN;
         ENDIF
 
@@ -173,7 +339,107 @@ MODULE PythonBridge
         PybSend "OK DONE TEST#";
     ENDPROC
 
+    PROC PybAbortTrajectory(string response)
+        PybSend response;
+        pybState := "ERROR";
+        TPWrite "Trajectory stopped: operator inspection required";
+        PybCloseClient;
+        Stop;
+    ENDPROC
+
+    PROC PybPlayTrajectory(num pointCount)
+        VAR num pointIndex;
+        VAR jointtarget firstPoint;
+        VAR jointtarget previousPoint;
+        VAR jointtarget nextPoint;
+        VAR jointtarget currentPoint;
+
+        IF toolState <> PYB_REQUIRED_TOOL_STATE THEN
+            PybSend "ERR WRONG_TOOL#";
+            RETURN;
+        ENDIF
+        IF pyHomeCaptured = FALSE THEN
+            PybSend "ERR NOT_CONFIGURED#";
+            RETURN;
+        ENDIF
+
+        pybState := "WAIT_FIRST";
+        PybSend "OK READY FIRST#";
+        PybReceiveStream;
+        IF pybStreamFrameReady = FALSE THEN
+            PybAbortTrajectory "ERR STREAM_LOST#";
+            RETURN;
+        ENDIF
+        IF PybParsePoint(firstPoint) = FALSE THEN
+            pybState := "IDLE";
+            PybSend "ERR BAD_POINT#";
+            RETURN;
+        ENDIF
+        IF PybJointDistance(firstPoint,pyHome) > PYB_HOME_TOLERANCE THEN
+            pybState := "IDLE";
+            PybSend "ERR NOT_AT_HOME#";
+            RETURN;
+        ENDIF
+
+        currentPoint := CJointT();
+        IF PybJointDistance(currentPoint,firstPoint) > PYB_HOME_TOLERANCE THEN
+            pybState := "IDLE";
+            PybSend "ERR NOT_AT_HOME#";
+            RETURN;
+        ENDIF
+
+        previousPoint := firstPoint;
+        pybState := "REPLAYING";
+        PybSend "OK ACCEPTED TRAJECTORY#";
+
+        FOR pointIndex FROM 2 TO pointCount DO
+            PybReceiveStream;
+            IF pybStreamFrameReady = FALSE THEN
+                PybAbortTrajectory "ERR STREAM_LOST#";
+                RETURN;
+            ENDIF
+            IF PybParsePoint(nextPoint) = FALSE THEN
+                PybAbortTrajectory "ERR BAD_POINT#";
+                RETURN;
+            ENDIF
+            IF PybJointDistance(previousPoint,nextPoint) >
+               PYB_MAX_JOINT_STEP THEN
+                PybAbortTrajectory "ERR STEP_TOO_LARGE#";
+                RETURN;
+            ENDIF
+            IF pointIndex = pointCount THEN
+                MoveAbsJ nextPoint,v10,fine,tool_P;
+            ELSE
+                MoveAbsJ nextPoint,v10,z0,tool_P;
+            ENDIF
+            previousPoint := nextPoint;
+
+            IF pointIndex MOD PYB_PROGRESS_INTERVAL = 0 OR
+               pointIndex = pointCount THEN
+                PybSend "OK RECEIVED " + NumToStr(pointIndex,0) + "#";
+            ENDIF
+        ENDFOR
+
+        WaitRob\InPos;
+        pybState := "IDLE";
+        PybSend "OK DONE TRAJECTORY#";
+    ENDPROC
+
     PROC PybProcessRequest()
+        VAR num pointCount;
+
+        IF pybState = "ERROR" THEN
+            IF PybIsCommand("GET_STATE",9) THEN
+                PybSend "OK STATE ERROR#";
+            ELSEIF PybIsCommand("QUIT",4) THEN
+                PybSend "OK BYE#";
+                pybClientConnected := FALSE;
+            ELSE
+                PybSend "ERR RECOVERY_REQUIRED#";
+            ENDIF
+            RETURN;
+        ENDIF
+
         IF PybIsCommand("PING",4) THEN
             PybSend "OK PONG#";
         ELSEIF PybIsCommand("GET_STATE",9) THEN
@@ -184,6 +450,12 @@ MODULE PythonBridge
             PybMoveHome;
         ELSEIF PybIsCommand("MOVE TEST",9) THEN
             PybMoveTest;
+        ELSEIF StrPart(pybRxFrame,1,11) = "PLAY BEGIN " THEN
+            IF PybParsePlayCount(pointCount) THEN
+                PybPlayTrajectory pointCount;
+            ELSE
+                PybSend "ERR BAD_POINT#";
+            ENDIF
         ELSEIF PybIsCommand("QUIT",4) THEN
             PybSend "OK BYE#";
             pybClientConnected := FALSE;
@@ -224,7 +496,8 @@ MODULE PythonBridge
         ENDWHILE
     ERROR
         errorNumber := NumToStr(ERRNO,0);
-        IF pybState = "MOVING" THEN
+        IF pybState = "MOVING" OR pybState = "REPLAYING" OR
+           pybState = "WAIT_FIRST" THEN
             PybSend "ERR MOTION " + errorNumber + "#";
         ELSE
             PybSend "ERR BRIDGE " + errorNumber + "#";

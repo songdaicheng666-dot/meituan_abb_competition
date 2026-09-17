@@ -8,6 +8,7 @@ from python.abb_client import (
     ProtocolError,
     ResponseBuffer,
     encode_request,
+    encode_trajectory_point,
     parse_joints,
 )
 
@@ -52,6 +53,17 @@ class ProtocolTests(unittest.TestCase):
     def test_parse_joints_rejects_wrong_count(self):
         with self.assertRaises(ProtocolError):
             parse_joints("OK JOINTS 1,2,3#")
+
+    def test_encode_trajectory_point_is_fixed_size(self):
+        frame = encode_trajectory_point([1, -2, 3.125, 4, 5, 6])
+        self.assertEqual(len(frame), 64)
+        self.assertEqual(frame.rstrip(), b"P 1.00 -2.00 3.12 4.00 5.00 6.00")
+
+    def test_encode_trajectory_point_rejects_invalid_values(self):
+        with self.assertRaises(ValueError):
+            encode_trajectory_point([1, 2, 3])
+        with self.assertRaises(ValueError):
+            encode_trajectory_point([1, 2, 3, 4, 5, float("nan")])
 
 
 class FakeBridge:
@@ -107,6 +119,56 @@ class ClientIntegrationTests(unittest.TestCase):
 
         self.assertEqual(bridge.requests[0].rstrip(), b"PING")
         self.assertEqual(bridge.requests[1].rstrip(), b"MOVE HOME")
+
+    def test_streams_trajectory_after_first_point_handshake(self):
+        responses = [
+            [b"OK READY FIRST#"],
+            [b"OK ACCEPTED TRAJECTORY#"],
+            [],
+            [b"OK RECEIVED 3#", b"OK DONE TRAJECTORY#"],
+        ]
+        with FakeBridge(responses) as bridge:
+            config = BridgeConfig(
+                host=bridge.host,
+                port=bridge.port,
+                connect_timeout=1,
+                response_timeout=1,
+                motion_timeout=1,
+            )
+            with AbbTcpClient(config) as client:
+                client.play_trajectory(
+                    [
+                        [0, 0, 0, 0, 0, 0],
+                        [0.5, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 0, 0, 0],
+                    ]
+                )
+
+        self.assertEqual(bridge.requests[0].rstrip(), b"PLAY BEGIN 3")
+        self.assertEqual(bridge.requests[1].rstrip(), b"P 0.00 0.00 0.00 0.00 0.00 0.00")
+        self.assertEqual(bridge.requests[2].rstrip(), b"P 0.50 0.00 0.00 0.00 0.00 0.00")
+        self.assertEqual(bridge.requests[3].rstrip(), b"P 0.00 0.00 0.00 0.00 0.00 0.00")
+
+    def test_trajectory_batches_align_to_controller_progress_boundaries(self):
+        responses = (
+            [[b"OK READY FIRST#"], [b"OK ACCEPTED TRAJECTORY#"]]
+            + [[] for _ in range(23)]
+            + [[b"OK RECEIVED 25#"], [b"OK RECEIVED 26#OK DONE TRAJECTORY#"]]
+        )
+        points = [[index / 100, 0, 0, 0, 0, 0] for index in range(26)]
+        with FakeBridge(responses) as bridge:
+            config = BridgeConfig(
+                host=bridge.host,
+                port=bridge.port,
+                connect_timeout=1,
+                response_timeout=1,
+                motion_timeout=1,
+            )
+            with AbbTcpClient(config) as client:
+                client.play_trajectory(points)
+
+        self.assertEqual(len(bridge.requests), 27)
+        self.assertEqual(bridge.requests[0].rstrip(), b"PLAY BEGIN 26")
 
 
 if __name__ == "__main__":
